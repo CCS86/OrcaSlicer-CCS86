@@ -1780,6 +1780,8 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "wall_direction"
             || opt_key == "enable_overhang_speed"
             || opt_key == "detect_thin_wall"
+            || opt_key == "wall_maximum_overlap"
+            || opt_key == "gap_fill_maximum_width"
             || opt_key == "precise_outer_wall") {
             steps.emplace_back(posPerimeters);
             steps.emplace_back(posSupportMaterial);
@@ -1795,6 +1797,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "wall_distribution_count"
             || opt_key == "wall_maximum_resolution"
             || opt_key == "wall_maximum_deviation"
+            || opt_key == "wall_width_tolerance"
+            || opt_key == "nominal_walls"
+            || opt_key == "nominal_walls_max_width"
+            || opt_key == "nominal_walls_min_filler_width"
             || opt_key == "min_feature_size"
             || opt_key == "min_length_factor"
             || opt_key == "min_bead_width") {

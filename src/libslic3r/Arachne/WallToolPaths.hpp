@@ -36,12 +36,49 @@ public:
     float   wall_transition_filter_deviation = 0.f;
     int     wall_distribution_count          = 1;
     bool    is_top_or_bottom_layer           = false;
+    // ORCA: when the bead count steps up, as fractions of the bead width: from one bead to two (split) and from an
+    // even count to the next odd one (add). Left at 0 they follow min_bead_width, which is also the width thin
+    // features are widened to; a caller that wants the steps elsewhere without widening sets them here.
+    double  wall_split_middle_threshold      = 0.;
+    double  wall_add_middle_threshold        = 0.;
+    // ORCA: at the bead count limit, leave extra thickness to the inner contour (infill) instead of widening the walls.
+    bool    overflow_early                   = false;
+    // ORCA: thresholds by inner bead count n, for the transition from n inner beads to n + 1 (see
+    // BeadingStrategy::setCountThresholds()). Empty: the two thresholds above.
+    std::vector<double> transition_thresholds;
 
     coord_t wall_maximum_resolution = meshfix_maximum_resolution();
     coord_t wall_maximum_deviation  = meshfix_maximum_deviation();
 };
 
 WallToolPathsParams make_paths_params(const int layer_id, const PrintObjectConfig &print_object_config, const PrintConfig &print_config);
+
+// ORCA: nominal walls. Arachne is set to keep its walls at nominal width and put the slack into one center line; these
+// shape that center line. split_center_walls():
+//  - Where a center line ends at a bead count transition, the two lines that take over start there too, each flaring
+//    from the center line's full width: they start a junction later instead, in their own lanes.
+//  - A center line wider than max_width becomes a wall of split_wall_width on its left and a filler on its right, which
+//    together cover exactly what it covered; the split ramps in and out over ramp_length.
+//  - Such a wall continues, at a transition, into the line that takes over in its lane.
+//  - With narrow_center_lines_are_fillers, center lines narrower than nominal_width all along are fillers.
+//  - No wall inside the outer walls is left wider than max_width, nor any filler narrower than min_filler_width:
+//    what Arachne still flares past the maximum covers what is covered already, and thinner fillers are left out.
+// Fillers are taken out of the toolpaths and returned, to be printed after the walls as gap fill.
+// All widths are spacings, as Arachne's are.
+ThickPolylines split_center_walls(std::vector<VariableWidthLines> &toolpaths, coord_t nominal_width, coord_t max_width, coord_t ramp_length,
+                                  coord_t min_filler_width, coord_t split_wall_width, bool narrow_center_lines_are_fillers);
+
+// ORCA: nominal walls leave extra thickness at the wall count limit to the inner contour, as strips too narrow for
+// infill. Takes the regions of infill_contour narrower than min_infill_width all over out of it and returns lines
+// filling them, as gap fill.
+ThickPolylines narrow_infill_strips(ExPolygons &infill_contour, coord_t min_infill_width, double min_width, double max_width);
+
+// ORCA: nominal walls put a single center line where Arachne would put a pair, and Arachne stops a single line short of
+// the narrow end of a tapering region, so the tips of such regions are left empty. Returns gap fill for what lies inside
+// outline but under none of the toolpaths, the fillers and the infill: no line narrower than min_width or wider than
+// max_width.
+ThickPolylines fill_uncovered(const Polygons &outline, const std::vector<VariableWidthLines> &toolpaths, const ThickPolylines &fillers,
+                              const ExPolygons &infill_contour, double min_width, double max_width);
 
 class WallToolPaths
 {

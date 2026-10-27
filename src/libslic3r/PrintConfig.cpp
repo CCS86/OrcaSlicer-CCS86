@@ -8082,6 +8082,39 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("wall_maximum_overlap", coPercent);
+    def->label = L("Maximum wall overlap");
+    def->category = L("Quality");
+    // xgettext:no-c-format, no-boost-format
+    def->tooltip = L("Classic wall generator only. Where a section is too narrow for another full wall loop, the loop is still "
+                     "placed as long as its opposite sides overlap by no more than this percentage of the line spacing. Past "
+                     "that, the space is left to gap fill. The overlap is not flow compensated, so it is over-extruded.\n\n"
+                     "40% is the long-standing behavior. Lower values trade overlap for wider gaps, up to nearly twice the line "
+                     "width at 0%, which pairs well with \"Maximum gap fill width\".\n\n"
+                     "The outer wall follows this setting only when \"Detect thin walls\" is enabled.");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 40;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(40));
+
+    def = this->add("gap_fill_maximum_width", coFloatOrPercent);
+    def->label = L("Maximum gap fill width");
+    def->category = L("Quality");
+    def->tooltip = L("Classic wall generator only. A gap between walls that would need a wider gap fill line than this is "
+                     "filled with side-by-side lines that share the gap evenly instead, so no gap fill line is wider than this. "
+                     "Very wide gap fill lines are hard to extrude well and tend to under-fill and bond poorly to the walls on "
+                     "either side.\n\n"
+                     "0 disables this: each gap gets a single line as wide as the gap, up to twice the inner wall line width.\n\n"
+                     "If expressed as a %, it will be computed over the nozzle diameter.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max = 1000;
+    def->max_literal = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+
     def = this->add("change_filament_gcode", coString);
     def->label = L("Change filament G-code");
     def->tooltip = L("This G-code is inserted when filament is changed, including T commands to trigger tool change.");
@@ -8717,27 +8750,89 @@ void PrintConfigDef::init_fff_params()
     def->max = 0.05f;
     def->set_default_value(new ConfigOptionFloat(0.025f));
 
-    def = this->add("initial_layer_min_bead_width", coPercent);
-    def->label = L("First layer minimum wall width");
+    def = this->add("wall_width_tolerance", coPercent);
+    def->label = L("Wall width tolerance");
     def->category = L("Quality");
-    def->tooltip = L("The minimum wall width that should be used for the first layer is recommended to be set "
-                     "to the same size as the nozzle. This adjustment is expected to enhance adhesion.");
+    // xgettext:no-c-format, no-boost-format
+    def->tooltip = L("Arachne varies wall line widths continuously, and every change of width starts a new G-code path, so walls "
+                     "become many short straight moves that arc fitting cannot join. Consecutive stretches whose widths stay within "
+                     "this percentage of the line width are printed as one path at their average width instead, which extrudes the "
+                     "same volume and lets arc fitting work along them. Larger values give longer arcs and smaller G-code, at the "
+                     "cost of local width differing from Arachne's by up to this much.\n\n"
+                     "0 starts a new path at every change of width, as before.");
     def->sidetext = "%";
     def->mode = comAdvanced;
     def->min = 0;
-    def->set_default_value(new ConfigOptionPercent(85));
+    def->max = 10;
+    def->set_default_value(new ConfigOptionPercent(0));
 
-    def = this->add("min_bead_width", coPercent);
+    def = this->add("nominal_walls", coBool);
+    def->label = L("Wall width limits (experimental)");
+    def->category = L("Quality");
+    def->tooltip = L("Limits the widths Arachne gives its walls. Walls widen up to the maximum wall width before another wall "
+                     "is added, and a change in the number of walls never leaves walls narrower than the minimum wall width "
+                     "side by side. Where one wall would pass the maximum before two could be wide enough (a maximum below "
+                     "twice the minimum wall width), it is split into a wall and a narrow filler, printed after the walls "
+                     "as gap fill. Also removes the extra width Arachne gives walls where their number changes, and fills "
+                     "strips left between walls that are too narrow for infill.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nominal_walls_max_width", coFloatOrPercent);
+    def->label = L("Maximum wall width");
+    def->category = L("Quality");
+    def->tooltip = L("With wall width limits: the widest a wall inside the outer walls may get. If expressed as a percentage, "
+                     "it is computed over the nozzle diameter. Values below the inner wall line width act as the inner wall "
+                     "line width.\n\n"
+                     "At twice the minimum wall width or more, no fillers are needed. Below that, a wall that would pass "
+                     "the maximum is split into a wall and a filler, and the maximum should be at least the inner wall line "
+                     "width plus the minimum filler width.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max_literal = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(135, true));
+
+    def = this->add("nominal_walls_min_filler_width", coFloatOrPercent);
+    def->label = L("Minimum filler width");
+    def->category = L("Quality");
+    def->tooltip = L("With wall width limits: the narrowest filler printed. Where a filler would be narrower, the wall beside it "
+                     "gives up the difference. If expressed as a percentage, it is computed over the nozzle diameter.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max_literal = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(25, true));
+
+    def = this->add("initial_layer_min_bead_width", coFloatOrPercent);
+    def->label = L("First layer minimum wall width");
+    def->category = L("Quality");
+    def->tooltip = L("The minimum wall width that should be used for the first layer is recommended to be set "
+                     "to the same size as the nozzle. This adjustment is expected to enhance adhesion. "
+                     "If expressed as a percentage, it is computed over the nozzle diameter.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->mode = comAdvanced;
+    def->min = 0;
+    def->max_literal = 10;
+    def->set_default_value(new ConfigOptionFloatOrPercent(85, true));
+
+    def = this->add("min_bead_width", coFloatOrPercent);
     def->label = L("Minimum wall width");
     def->category = L("Quality");
     def->tooltip = L("Width of the wall that will replace thin features (according to the Minimum feature size) "
         "of the model. If the Minimum wall width is thinner than the thickness of the feature,"
         " the wall will become as thick as the feature itself. "
-        "It's expressed as a percentage over nozzle diameter.");
-    def->sidetext = "%";
+        "If expressed as a percentage, it is computed over the nozzle diameter. "
+        "With wall width limits, also the narrowest that walls side by side may get.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
     def->mode = comAdvanced;
     def->min = 0;
-    def->set_default_value(new ConfigOptionPercent(85));
+    def->max_literal = 10;
+    def->set_default_value(new ConfigOptionFloatOrPercent(85, true));
 
     def = this->add("filament_dev_ams_drying_ams_limitations", coStrings);
     def->set_default_value(new ConfigOptionStrings{""});

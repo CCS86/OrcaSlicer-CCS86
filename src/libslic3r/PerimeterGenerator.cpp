@@ -411,6 +411,10 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
     bool overhangs_reverse = perimeter_generator.config->overhang_reverse &&
                              perimeter_generator.layer_id % 2 == 1;  // Only calculate overhang degree on even (from GUI POV) layers
 
+    // ORCA: how far the widths along one path may spread, wall_width_tolerance of the line's width; 0 keeps a path per width.
+    const double width_tolerance = perimeter_generator.object_config->wall_width_tolerance.value / 100.;
+    auto width_band = [width_tolerance](const Flow &flow) { return float(width_tolerance * flow.scaled_width()); };
+
     ExtrusionEntityCollection extrusion_coll;
     for (PerimeterGeneratorArachneExtrusion& pg_extrusion : pg_extrusions) {
         Arachne::ExtrusionLine* extrusion = pg_extrusion.extrusion;
@@ -454,7 +458,8 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
 
             // get non-overhang paths by intersecting this loop with the grown lower slices
             extrusion_paths_append(paths, clip_extrusion(extrusion_path, lower_slices_paths, ctIntersection), role,
-                                   is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow);
+                                   is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow,
+                                   width_band(is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow));
 
             // Always reverse extrusion if use fuzzy skin: https://github.com/OrcaSlicer/OrcaSlicer/pull/2413#issuecomment-1769735357
             if (overhangs_reverse && perimeter_generator.has_fuzzy_skin) {
@@ -495,7 +500,7 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
             // outside the grown lower slices (thus where the distance between
             // the loop centerline and original lower slices is >= half nozzle diameter
             extrusion_paths_append(paths, clip_extrusion(extrusion_path, lower_slices_paths, ctDifference), erOverhangPerimeter,
-                perimeter_generator.overhang_flow);
+                perimeter_generator.overhang_flow, width_band(perimeter_generator.overhang_flow));
 
             // Reapply the nearest point search for starting point.
             // We allow polyline reversal because Clipper may have randomly reversed polylines during clipping.
@@ -556,7 +561,8 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                 steep_overhang_hole    = true;
             }
 
-            extrusion_paths_append(paths, *extrusion, role, is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow);
+            extrusion_paths_append(paths, *extrusion, role, is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow,
+                                   width_band(is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow));
         }
 
         // Append paths to collection.
@@ -1454,6 +1460,113 @@ static void defer_unsupported_loops(const PerimeterGenerator &perimeter_generato
             loop->print_after_infill = true;
 }
 
+// ORCA: the area covered by the lines of a thick polyline: a quad per segment and a disc at each inner joint, so that
+// adjoining lines leave no seam open between them.
+static Polygons thick_polyline_footprint(const ThickPolyline &thick_polyline)
+{
+    Polygons out;
+    const ThickLines lines = thick_polyline.thicklines();
+    for (size_t i = 0; i < lines.size(); ++ i) {
+        const ThickLine &line = lines[i];
+        const Vec2d      a    = line.a.cast<double>();
+        const Vec2d      b    = line.b.cast<double>();
+        const Vec2d      ab   = b - a;
+        const double     len  = ab.norm();
+        if (len < 1.)
+            continue;
+        const Vec2d normal(- ab.y() / len, ab.x() / len);
+        Polygon quad({ (a + normal * (0.5 * line.a_width)).cast<coord_t>(), (b + normal * (0.5 * line.b_width)).cast<coord_t>(),
+                       (b - normal * (0.5 * line.b_width)).cast<coord_t>(), (a - normal * (0.5 * line.a_width)).cast<coord_t>() });
+        quad.make_counter_clockwise();
+        out.emplace_back(std::move(quad));
+        if (i + 1 < lines.size() && line.b_width > 0.) {
+            Polygon disc;
+            for (int k = 0; k < 12; ++ k) {
+                const double angle = 2. * PI * k / 12.;
+                disc.points.emplace_back((b + Vec2d(cos(angle), sin(angle)) * (0.5 * line.b_width)).cast<coord_t>());
+            }
+            out.emplace_back(std::move(disc));
+        }
+    }
+    return out;
+}
+
+// ORCA: gap fill between classic walls, no line wider than max_spacing (gap_fill_maximum_width as a spacing).
+// The medial axis fills a gap with one line as wide as the gap, and a gap where that line stays within the limit is left
+// to it, as before. A gap with any wider stretch is split into side by side lines sharing its width evenly. Along a gap
+// whose width wanders across the limit the line count has to step between one and two, and stepping smoothly is what
+// Arachne's skeletal trapezoidation does, so it is reused on each such gap by itself; the walls stay classic. Arachne's
+// beading steps from one line to two at (1 + split) * bead width, so the two are chosen to put that step at max_spacing.
+// The thresholds are passed in directly, leaving min_bead_width at the gap fill minimum, so a narrow gap still gets a line
+// as wide as the gap, not one widened into the walls.
+// Arachne's lines stop short of the narrow end of a tapering gap and of its sharp corners, so the gap fill runs once more
+// on just the part they leave unfilled, again no wider than the limit: the recursive gap fill of OrcaSlicer issue #4493.
+static ThickPolylines gap_fill_limited_width(const ExPolygons &gaps, coord_t max_spacing, coord_t max_gap_width, coord_t perimeter_spacing,
+                                             double min_width, double layer_height, Arachne::WallToolPathsParams params)
+{
+    // A bead width of one perimeter spacing keeps every gap the classic onion leaves (under two spacings wide) to two
+    // lines at most. A limit under 1.01 spacings needs a narrower bead, and more lines in the widest gaps.
+    const double  split       = std::clamp(double(max_spacing) / double(perimeter_spacing) - 1., 0.01, 0.99);
+    const coord_t bead_width  = coord_t(double(max_spacing) / (1. + split));
+    // Enough beads for the widest gap, so none is left partly empty. An inset is up to two of them.
+    const size_t  inset_count = size_t(max_gap_width / bead_width) / 2 + 2;
+    params.min_bead_width              = float(unscaled(min_width));
+    params.min_feature_size            = float(unscaled(min_width));
+    params.wall_split_middle_threshold = split;
+    params.wall_add_middle_threshold   = split;
+    // The transition filter lets a line run wider than the step to two lines by up to this margin rather than step up for a
+    // short stretch. Taken from the Arachne wall settings it could pass the limit by a tenth of a millimetre; here it may
+    // pass it by no more than 5%.
+    params.wall_transition_filter_deviation = std::min(params.wall_transition_filter_deviation, float(0.05 * unscaled(max_spacing)));
+    // Grows Arachne's coverage a little, so that the seams between its own lines are not taken for unfilled gap.
+    const float   seam_tolerance       = float(scaled<double>(0.01));
+    // Shorter leftover lines are slivers at the ends of Arachne's lines, not gaps it left.
+    const double  min_leftover_length  = 0.5 * double(bead_width);
+
+    ThickPolylines out;
+    for (const ExPolygon &gap : gaps) {
+        ThickPolylines single;
+        gap.medial_axis(min_width, double(max_gap_width), &single);
+        double widest = 0.;
+        for (const ThickPolyline &thick_polyline : single)
+            for (const coordf_t width : thick_polyline.width)
+                widest = std::max(widest, double(width));
+        if (widest <= double(max_spacing)) {
+            append(out, std::move(single));
+            continue;
+        }
+
+        // WallToolPaths keeps a reference to its outline and only reads it in getToolPaths(), so the outline has to
+        // outlive it: no temporary here.
+        const Polygons         outline = to_polygons(gap);
+        Arachne::WallToolPaths wall_tool_paths(outline, bead_width, bead_width, inset_count, 0, layer_height, params);
+        ThickPolylines         split_lines;
+        for (const Arachne::VariableWidthLines &lines : wall_tool_paths.getToolPaths())
+            for (const Arachne::ExtrusionLine &line : lines)
+                if (line.size() >= 2)
+                    split_lines.emplace_back(Arachne::to_thick_polyline(line));
+        if (split_lines.empty()) {
+            append(out, std::move(single));
+            continue;
+        }
+
+        Polygons covered;
+        for (const ThickPolyline &thick_polyline : split_lines)
+            append(covered, thick_polyline_footprint(thick_polyline));
+        // The opening drops the hairline slivers left along the gap's edges and between Arachne's lines.
+        ExPolygons     unfilled = opening_ex(diff_ex(gap, offset(covered, seam_tolerance)), float(0.5 * min_width));
+        ThickPolylines leftovers;
+        for (const ExPolygon &area : unfilled)
+            area.medial_axis(min_width, double(max_spacing), &leftovers);
+        leftovers.erase(std::remove_if(leftovers.begin(), leftovers.end(),
+                                       [min_leftover_length](const ThickPolyline &p) { return p.length() < min_leftover_length; }),
+                        leftovers.end());
+        append(out, std::move(split_lines));
+        append(out, std::move(leftovers));
+    }
+    return out;
+}
+
 void PerimeterGenerator::process_classic()
 {
     group_region_by_fuzzify(*this);
@@ -1500,11 +1613,19 @@ void PerimeterGenerator::process_classic()
     // which is the spacing between external and internal, which is not correct
     // and would make the collapsing (thus the details resolution) dependent on
     // internal flow which is unrelated.
-    coord_t min_spacing         = coord_t(perimeter_spacing      * (1 - INSET_OVERLAP_TOLERANCE));
-    coord_t ext_min_spacing     = coord_t(ext_perimeter_spacing  * (1 - INSET_OVERLAP_TOLERANCE));
+    // ORCA: how far the sides of a loop may overlap is set by wall_maximum_overlap, INSET_OVERLAP_TOLERANCE by default.
+    const double wall_overlap   = this->config->wall_maximum_overlap.value / 100.;
+    coord_t min_spacing         = coord_t(perimeter_spacing      * (1 - wall_overlap));
+    coord_t ext_min_spacing     = coord_t(ext_perimeter_spacing  * (1 - wall_overlap));
     bool    has_gap_fill 		= this->config->gap_infill_speed.get_at(get_extruder_index(*print_config, this->config->outer_wall_filament_id - 1)) > 0;
     // ORCA: Use the smaller width as the lower bound to avoid overestimating safe overlap
     const double gap_fill_min_width = 0.2 * std::min(perimeter_width, ext_perimeter_width) * (1 - INSET_OVERLAP_TOLERANCE);
+    // ORCA: gap_fill_maximum_width is a line width; the gaps and the beads filling them are measured in spacings. A limit
+    // at or above the widest gap (two perimeter spacings) changes nothing, and one under half a spacing is raised to that.
+    const double gap_fill_max_width = this->config->gap_fill_maximum_width.get_abs_value(this->perimeter_flow.nozzle_diameter());
+    const coord_t gap_fill_max_spacing = gap_fill_max_width > 0. ?
+        std::max(scaled<coord_t>(gap_fill_max_width - this->layer_height * (1. - 0.25 * PI)), perimeter_spacing / 2) : 0;
+    const bool split_gap_fill = gap_fill_max_spacing > 0 && gap_fill_max_spacing < 2 * perimeter_spacing;
 
     // BBS: this flow is for smaller external perimeter for small area
     coord_t ext_min_spacing_smaller = coord_t(ext_perimeter_spacing * (1 - SMALLER_EXT_INSET_OVERLAP_TOLERANCE));
@@ -1982,8 +2103,12 @@ void PerimeterGenerator::process_classic()
             for (ExPolygon& ex : gaps_ex) {
                 //BBS: Use DP simplify to avoid duplicated points and accelerate medial-axis calculation as well.
                 ex.douglas_peucker(surface_simplify_resolution);
-                ex.medial_axis(min, max, &polylines);
+                if (! split_gap_fill)
+                    ex.medial_axis(min, max, &polylines);
             }
+            if (split_gap_fill)
+                polylines = gap_fill_limited_width(gaps_ex, gap_fill_max_spacing, coord_t(max), perimeter_spacing, min, this->layer_height,
+                                                   Arachne::make_paths_params(this->layer_id, *object_config, *print_config));
 
 #ifdef GAPS_OF_PERIMETER_DEBUG_TO_SVG
             {
@@ -2628,6 +2753,40 @@ void PerimeterGenerator::process_arachne()
             Arachne::WallToolPathsParams input_params = Arachne::make_paths_params(this->layer_id, *object_config, *print_config);
             // Set params is_top_or_bottom_layer for adjusting short-wall removal sensitivity.
             input_params.is_top_or_bottom_layer = (is_bottom_layer || is_topmost_layer) ? true : false;
+            // ORCA: wall width limits. Walls widen up to the maximum wall width before another is added, and a transition
+            // leaves no walls side by side narrower than the minimum wall width: a middle wall splits into two once each
+            // half is that wide, and one is added between two once it can be that wide and they would otherwise pass the
+            // maximum. Widths are spacings, against the inner wall's, as the walls they change are inner walls. Where one
+            // wall would pass the maximum before two could be wide enough, Arachne::split_center_walls() splits it after
+            // the fact into a wall and a filler.
+            const bool nominal_walls = object_config->nominal_walls.value;
+            if (nominal_walls) {
+                const double nozzle_diameter = this->perimeter_flow.nozzle_diameter();
+                const double spacing_offset  = this->layer_height * (1. - 0.25 * PI);
+                const double inner           = unscaled(perimeter_spacing);
+                const double min_wall        = std::max(double(input_params.min_bead_width) - spacing_offset, 0.01);
+                const double max_wall        = std::max(object_config->nominal_walls_max_width.get_abs_value(nozzle_diameter) - spacing_offset, inner);
+                // The transition filter keeps two walls on through a short narrowing, up to its margin narrower than where
+                // they split: the split allows for it, so that the minimum holds there too.
+                const double filter_margin   = std::max(double(input_params.wall_transition_filter_deviation), 0.);
+                input_params.wall_split_middle_threshold = std::clamp(2. * (min_wall + filter_margin) / inner - 1., 0.01, 0.99);
+                input_params.wall_add_middle_threshold   = std::clamp(std::min(min_wall / inner, 2. * (max_wall / inner - 1.)), 0.01, 0.99);
+                // From n inner walls to n + 1 where both are as far from the inner wall width: n / (2n + 1) of the way.
+                // Within the limits: the n + 1 walls no narrower than the minimum (with the filter's margin), the n no
+                // wider than the maximum; where the two conflict the minimum holds, a single wall too wide being split
+                // into a wall and a filler afterwards. From none to one, once the new wall can be the minimum.
+                const double rho = (min_wall + filter_margin) / inner;
+                const double r   = max_wall / inner;
+                std::vector<double> thresholds(2 * size_t(std::max(loop_number + 1, 1)) + 2);
+                thresholds[0] = std::clamp(min_wall / inner, 0.01, 0.99);
+                for (size_t n = 1; n < thresholds.size(); ++ n) {
+                    const double lo       = double(n + 1) * rho - double(n);
+                    const double hi       = double(n) * (r - 1.);
+                    const double balanced = double(n) / double(2 * n + 1);
+                    thresholds[n] = std::clamp(lo > hi ? lo : std::clamp(balanced, lo, hi), 0.01, 0.99);
+                }
+                input_params.transition_thresholds = std::move(thresholds);
+            }
 
             coord_t wall_0_inset = 0;
             if (apply_precise_outer_wall)
@@ -2775,6 +2934,27 @@ void PerimeterGenerator::process_arachne()
                 }
             }
             //PS
+
+            // ORCA: wall width limits: center lines are split where too wide, and the fillers, with the strips of the
+            // inner contour too narrow for infill, are printed as gap fill, after the walls.
+            if (nominal_walls) {
+                const double   nozzle_diameter = this->perimeter_flow.nozzle_diameter();
+                const double   spacing_offset  = this->layer_height * (1. - 0.25 * PI);
+                const coord_t  max_wall        = scaled<coord_t>(std::max(object_config->nominal_walls_max_width.get_abs_value(nozzle_diameter) - spacing_offset, 0.01));
+                const coord_t  min_filler      = scaled<coord_t>(std::max(object_config->nominal_walls_min_filler_width.get_abs_value(nozzle_diameter) - spacing_offset, 0.01));
+                ThickPolylines fillers         = Arachne::split_center_walls(perimeters, perimeter_spacing, max_wall, scaled<coord_t>(0.5), min_filler,
+                                                                             max_wall, false);
+                append(fillers, Arachne::narrow_infill_strips(infill_contour, perimeter_spacing, double(min_filler), 2. * double(perimeter_spacing)));
+                if (this->config->filter_out_gap_fill.value > 0.)
+                    fillers.erase(std::remove_if(fillers.begin(), fillers.end(),
+                                                 [this](const ThickPolyline &p) { return p.length() < scale_(this->config->filter_out_gap_fill.value); }),
+                                  fillers.end());
+                if (! fillers.empty()) {
+                    ExtrusionEntityCollection gap_fill;
+                    variable_width(fillers, erGapFill, this->solid_infill_flow, gap_fill.entities);
+                    this->gap_fill->append(std::move(gap_fill.entities));
+                }
+            }
 
             loop_number = int(perimeters.size()) - 1;
 

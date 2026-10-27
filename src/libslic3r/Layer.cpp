@@ -178,6 +178,8 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
 		&& config.opt_serialize("inner_wall_line_width") == other_config.opt_serialize("inner_wall_line_width")
 		&& config.opt_serialize("outer_wall_line_width") == other_config.opt_serialize("outer_wall_line_width")
 		&& config.detect_thin_wall                  == other_config.detect_thin_wall
+		&& config.wall_maximum_overlap              == other_config.wall_maximum_overlap
+		&& config.gap_fill_maximum_width            == other_config.gap_fill_maximum_width
 		&& config.infill_wall_overlap              == other_config.infill_wall_overlap
         && config.top_bottom_infill_wall_overlap              == other_config.top_bottom_infill_wall_overlap
         // Orca: these flags directly change the effective wall count produced by the perimeter

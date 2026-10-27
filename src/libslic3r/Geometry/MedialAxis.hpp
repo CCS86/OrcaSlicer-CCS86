@@ -17,6 +17,9 @@ class MedialAxis {
 public:
     MedialAxis(double min_width, double max_width, const ExPolygon &expolygon);
     void build(ThickPolylines* polylines);
+    // ORCA: false also keeps the axis where the two sides are far from parallel, as towards the tip of a wedge;
+    // true keeps it only in narrow, oriented areas, as gap fill wants.
+    bool oriented_only { true };
     void build(Polylines* polylines);
     
 private:

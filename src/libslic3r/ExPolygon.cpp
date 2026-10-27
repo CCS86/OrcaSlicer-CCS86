@@ -268,8 +268,14 @@ void ExPolygon::simplify(double tolerance, ExPolygons* expolygons) const
 
 void ExPolygon::medial_axis(double min_width, double max_width, ThickPolylines* polylines) const
 {
+    this->medial_axis(min_width, max_width, polylines, true);
+}
+
+void ExPolygon::medial_axis(double min_width, double max_width, ThickPolylines* polylines, bool oriented_only) const
+{
     // init helper object
     Slic3r::Geometry::MedialAxis ma(min_width, max_width, *this);
+    ma.oriented_only = oriented_only;
     
     // compute the Voronoi diagram and extract medial axis polylines
     ThickPolylines pp;
@@ -327,7 +333,8 @@ void ExPolygon::medial_axis(double min_width, double max_width, ThickPolylines* 
             (we can't do this check before endpoints extension and clipping because we don't
             know how long will the endpoints be extended since it depends on polygon thickness
             which is variable - extension will be <= max_width/2 on each side)  */
-        if ((polyline.endpoints.first || polyline.endpoints.second)
+        // ORCA: kept when not oriented_only: the tip of a wedge is short for its width.
+        if (oriented_only && (polyline.endpoints.first || polyline.endpoints.second)
             && polyline.length() < max_w*2) {
             pp.erase(pp.begin() + i);
             --i;

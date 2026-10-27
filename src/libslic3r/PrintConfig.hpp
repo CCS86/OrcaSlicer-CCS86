@@ -1387,12 +1387,16 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,              wall_transition_angle))
     ((ConfigOptionInt,                wall_distribution_count))
     ((ConfigOptionPercent,            min_feature_size))
-    ((ConfigOptionPercent,            initial_layer_min_bead_width))
-    ((ConfigOptionPercent,            min_bead_width))
+    ((ConfigOptionFloatOrPercent,     initial_layer_min_bead_width))
+    ((ConfigOptionFloatOrPercent,     min_bead_width))
 
     // Orca
     ((ConfigOptionFloat,              wall_maximum_resolution))
     ((ConfigOptionFloat,              wall_maximum_deviation))
+    ((ConfigOptionPercent,            wall_width_tolerance))
+    ((ConfigOptionBool,               nominal_walls))
+    ((ConfigOptionFloatOrPercent,     nominal_walls_max_width))
+    ((ConfigOptionFloatOrPercent,     nominal_walls_min_filler_width))
     ((ConfigOptionFloat,              make_overhang_printable_angle))
     ((ConfigOptionFloat,              make_overhang_printable_hole_size))
     ((ConfigOptionFloat,              tree_support_branch_distance_organic))
@@ -1555,6 +1559,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable, internal_solid_infill_speed))
     // Detect thin walls.
     ((ConfigOptionBool, detect_thin_wall))
+    ((ConfigOptionPercent,             wall_maximum_overlap))
+    ((ConfigOptionFloatOrPercent,      gap_fill_maximum_width))
     ((ConfigOptionFloatOrPercent, top_surface_line_width))
     ((ConfigOptionInt, top_shell_layers))
     ((ConfigOptionFloat, top_shell_thickness))

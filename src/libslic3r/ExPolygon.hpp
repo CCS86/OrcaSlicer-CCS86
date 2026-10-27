@@ -78,6 +78,8 @@ public:
     ExPolygons simplify(double tolerance) const;
     void simplify(double tolerance, ExPolygons* expolygons) const;
     void medial_axis(double min_width, double max_width, ThickPolylines* polylines) const;
+    // ORCA: oriented_only false also follows the axis where the sides are far from parallel, as into the tip of a wedge.
+    void medial_axis(double min_width, double max_width, ThickPolylines* polylines, bool oriented_only) const;
     void medial_axis(double min_width, double max_width, Polylines* polylines) const;
     Polylines medial_axis(double min_width, double max_width) const 
         { Polylines out; this->medial_axis(min_width, max_width, &out); return out; }
