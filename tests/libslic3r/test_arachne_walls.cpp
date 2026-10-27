@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/catch_message.hpp>
+#include "libslic3r/Arachne/BeadingStrategy/DistributedBeadingStrategy.hpp"
 #include "libslic3r/Arachne/WallToolPaths.hpp"
 #include "libslic3r/Arachne/SkeletalTrapezoidation.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionLine.hpp"
@@ -389,4 +390,21 @@ TEST_CASE("Fuzzy skin displacement mode leaves widths untouched", "[Arachne][Fuz
 
     REQUIRE(loop.size() > 100);
     CHECK(std::all_of(loop.begin(), loop.end(), [width](const auto& j) { return j.w == width; }));
+}
+
+TEST_CASE("Distributed beading keeps the middle bead on the center line", "[Arachne][Regression]") {
+    // With a wall distribution count of 3 or more, rounding put the middle bead of an odd count a few nanometres off the
+    // center line, and SkeletalTrapezoidation::generateJunctions() drops beads more than 1 nm off it: the middle wall
+    // went missing.
+    const coord_t width = scaled<coord_t>(0.45);
+    for (int distribution_count = 1; distribution_count <= 6; ++ distribution_count) {
+        const DistributedBeadingStrategy strategy(width, scaled<coord_t>(0.4), PI / 4., 0.5, 0.5, distribution_count);
+        for (coord_t bead_count = 3; bead_count <= 9; bead_count += 2)
+            for (const double ratio : {0.9, 1.0, 1.13}) {
+                const coord_t                  thickness = coord_t(double(bead_count * width) * ratio);
+                const BeadingStrategy::Beading beading   = strategy.compute(thickness, bead_count);
+                INFO("distribution count " << distribution_count << ", " << bead_count << " beads, thickness " << thickness);
+                CHECK(beading.toolpath_locations[size_t(bead_count / 2)] == thickness / 2);
+            }
+    }
 }

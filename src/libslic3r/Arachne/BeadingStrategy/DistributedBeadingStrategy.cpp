@@ -64,6 +64,12 @@ DistributedBeadingStrategy::Beading DistributedBeadingStrategy::compute(const co
         }
         ret.left_over = 0;
         assert((accumulated_width + ret.left_over) == thickness);
+        // ORCA: the middle bead of an odd count lies on the center line, exactly. Truncating each bead's share of the width
+        // separately leaves it a few nanometres off at a distribution count of 3 or more, and
+        // SkeletalTrapezoidation::generateJunctions() drops a middle bead more than 1 nm past the center: the middle wall
+        // broke there, leaving gaps in the walls.
+        if (bead_count % 2 == 1)
+            ret.toolpath_locations[bead_count / 2] = thickness / 2;
     } else if (bead_count == 2) {
         const coord_t outer_width = thickness / 2;
         ret.bead_widths.emplace_back(outer_width);
