@@ -1,10 +1,14 @@
 // Tests for VariableWidth: turning variable width lines, as Arachne makes them, into extrusion paths.
 
-#include <catch2/catch_all.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 
-#include "libslic3r/VariableWidth.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/Point.hpp"
 #include "libslic3r/Polyline.hpp"
+#include "libslic3r/VariableWidth.hpp"
+#include "libslic3r/libslic3r.h"
 
 using namespace Slic3r;
 using Catch::Approx;
