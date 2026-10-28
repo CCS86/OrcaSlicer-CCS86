@@ -393,18 +393,49 @@ TEST_CASE("Fuzzy skin displacement mode leaves widths untouched", "[Arachne][Fuz
 }
 
 TEST_CASE("Distributed beading keeps the middle bead on the center line", "[Arachne][Regression]") {
-    // With a wall distribution count of 3 or more, rounding put the middle bead of an odd count a few nanometres off the
-    // center line, and SkeletalTrapezoidation::generateJunctions() drops beads more than 1 nm off it: the middle wall
-    // went missing.
-    const coord_t width = scaled<coord_t>(0.45);
-    for (int distribution_count = 1; distribution_count <= 6; ++ distribution_count) {
-        const DistributedBeadingStrategy strategy(width, scaled<coord_t>(0.4), PI / 4., 0.5, 0.5, distribution_count);
-        for (coord_t bead_count = 3; bead_count <= 9; bead_count += 2)
-            for (const double ratio : {0.9, 1.0, 1.13}) {
-                const coord_t                  thickness = coord_t(double(bead_count * width) * ratio);
-                const BeadingStrategy::Beading beading   = strategy.compute(thickness, bead_count);
-                INFO("distribution count " << distribution_count << ", " << bead_count << " beads, thickness " << thickness);
-                CHECK(beading.toolpath_locations[size_t(bead_count / 2)] == thickness / 2);
-            }
-    }
+    // Rounding put the middle bead of an odd bead count a few nanometres off the center line at a wall distribution
+    // count of 3 or more, and SkeletalTrapezoidation::generateJunctions() drops a bead more than 1 nm past it.
+    const int    distribution_count = GENERATE(1, 2, 3, 4, 5, 6);
+    const int    bead_count         = GENERATE(3, 5, 7, 9);
+    const double ratio              = GENERATE(0.9, 1.0, 1.13);
+
+    const coord_t                    width = scaled<coord_t>(0.45);
+    const DistributedBeadingStrategy strategy(width, scaled<coord_t>(0.4), PI / 4., 0.5, 0.5, distribution_count);
+    const coord_t                    thickness = coord_t(double(bead_count * width) * ratio);
+    const BeadingStrategy::Beading   beading   = strategy.compute(thickness, bead_count);
+    INFO("distribution count " << distribution_count << ", " << bead_count << " beads, thickness " << thickness);
+    CHECK(beading.toolpath_locations[size_t(bead_count / 2)] == thickness / 2);
+}
+
+TEST_CASE("Wall distribution count does not remove the middle wall", "[Arachne][Regression]") {
+    // The wall distribution count only decides how the walls share the width; where an odd number of walls leaves a
+    // middle wall does not depend on it. So a strip tapering through odd wall counts has the same middle wall at every
+    // distribution count. At 3 or more, rounding in DistributedBeadingStrategy used to drop parts of it.
+    const int distribution_count = GENERATE(3, 4, 5, 6);
+
+    constexpr double layer_height   = 0.28;
+    const double     spacing_offset = layer_height * (1. - 0.25 * PI);
+    const coord_t    bead_width_0   = scaled<coord_t>(0.42 - spacing_offset);
+    const coord_t    bead_width_x   = scaled<coord_t>(0.45 - spacing_offset);
+    // 30 mm long, tapering from 2.0772 to 2.6966 mm: from 5 walls to 7.
+    const Polygons outline{ Polygon({ Point::new_scale(0., 0.), Point::new_scale(30., 0.), Point::new_scale(30., 2.6966),
+                                      Point::new_scale(0., 2.0772) }) };
+
+    const auto middle_wall_length = [&](int count) {
+        WallToolPathsParams params     = make_bbl_x1c_028_params(85);
+        params.wall_distribution_count = count;
+        WallToolPaths walls(outline, bead_width_0, bead_width_x, 5, 0, layer_height, params);
+        double        length = 0.;
+        for (const VariableWidthLines &lines : walls.getToolPaths())
+            for (const ExtrusionLine &line : lines)
+                if (line.is_odd)
+                    for (size_t i = 1; i < line.junctions.size(); ++ i)
+                        length += unscaled((line.junctions[i].p - line.junctions[i - 1].p).cast<double>().norm());
+        return length;
+    };
+
+    const double reference = middle_wall_length(1);
+    REQUIRE(reference > 1.); // the strip has a middle wall to lose
+    INFO("distribution count " << distribution_count);
+    CHECK(std::abs(middle_wall_length(distribution_count) - reference) < 0.05);
 }

@@ -53,8 +53,9 @@ DistributedBeadingStrategy::Beading DistributedBeadingStrategy::compute(const co
             const coord_t splitup_left_over_weight = to_be_divided * weight_fraction;
             const coord_t width                    = (bead_idx == bead_count - 1) ? thickness - accumulated_width : optimal_width + splitup_left_over_weight;
 
-            // Be aware that toolpath_locations is computed by dividing the width by 2, so toolpath_locations
-            // could be off by 1 because of rounding errors.
+            // Be aware that toolpath_locations is computed by dividing the width by 2, and each bead's share of the
+            // width is truncated separately, so toolpath_locations can be a few nanometres off because of rounding
+            // errors. The middle bead of an odd bead count is put on the center line exactly, below.
             if (bead_idx == 0)
                 ret.toolpath_locations.emplace_back(width / 2);
             else
