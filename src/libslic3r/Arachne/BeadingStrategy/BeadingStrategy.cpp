@@ -23,6 +23,7 @@ BeadingStrategy::BeadingStrategy(const BeadingStrategy &other)
     : optimal_width(other.optimal_width)
     , wall_split_middle_threshold(other.wall_split_middle_threshold)
     , wall_add_middle_threshold(other.wall_add_middle_threshold)
+    , count_thresholds(other.count_thresholds)
     , default_transition_length(other.default_transition_length)
     , transitioning_angle(other.transitioning_angle)
     , name(other.name)
@@ -58,6 +59,18 @@ double BeadingStrategy::getSplitMiddleThreshold() const
     return wall_split_middle_threshold;
 }
 
+void BeadingStrategy::setCountThresholds(std::vector<double> thresholds)
+{
+    count_thresholds = std::move(thresholds);
+}
+
+double BeadingStrategy::thresholdFor(coord_t lower_bead_count) const
+{
+    if (lower_bead_count >= 0 && size_t(lower_bead_count) < count_thresholds.size())
+        return count_thresholds[size_t(lower_bead_count)];
+    return lower_bead_count % 2 == 1 ? wall_split_middle_threshold : wall_add_middle_threshold;
+}
+
 double BeadingStrategy::getTransitioningAngle() const
 {
     return transitioning_angle;
@@ -72,7 +85,7 @@ coord_t BeadingStrategy::getTransitionThickness(coord_t lower_bead_count) const
 {
     const coord_t lower_ideal_width  = getOptimalThickness(lower_bead_count);
     const coord_t higher_ideal_width = getOptimalThickness(lower_bead_count + 1);
-    const double  threshold          = lower_bead_count % 2 == 1 ? wall_split_middle_threshold : wall_add_middle_threshold;
+    const double  threshold          = thresholdFor(lower_bead_count);
     return lower_ideal_width + threshold * (higher_ideal_width - lower_ideal_width);
 }
 

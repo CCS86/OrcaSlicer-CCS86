@@ -64,6 +64,12 @@ DistributedBeadingStrategy::Beading DistributedBeadingStrategy::compute(const co
         }
         ret.left_over = 0;
         assert((accumulated_width + ret.left_over) == thickness);
+        // ORCA: the middle bead of an odd count lies on the centreline, exactly. Truncating each bead's share of the width
+        // separately leaves it a few nanometres off, past the centre at a distribution count over 3, and
+        // SkeletalTrapezoidation::generateJunctions() drops a middle bead more than 1 nm past the centre: the middle wall
+        // broke there, leaving gaps in the walls.
+        if (bead_count % 2 == 1)
+            ret.toolpath_locations[bead_count / 2] = thickness / 2;
     } else if (bead_count == 2) {
         const coord_t outer_width = thickness / 2;
         ret.bead_widths.emplace_back(outer_width);
@@ -94,7 +100,7 @@ coord_t DistributedBeadingStrategy::getOptimalBeadCount(coord_t thickness) const
 {
     const coord_t naive_count        = thickness / optimal_width;               // How many lines we can fit in for sure.
     const coord_t remainder          = thickness - naive_count * optimal_width; // Space left after fitting that many lines.
-    const coord_t minimum_line_width = optimal_width * (naive_count % 2 == 1 ? wall_split_middle_threshold : wall_add_middle_threshold);
+    const coord_t minimum_line_width = optimal_width * thresholdFor(naive_count);
     return naive_count + (remainder >= minimum_line_width); // If there's enough space, fit an extra one.
 }
 

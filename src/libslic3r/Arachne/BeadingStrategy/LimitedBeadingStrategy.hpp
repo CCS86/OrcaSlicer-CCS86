@@ -45,6 +45,10 @@ public:
 
 protected:
     const coord_t max_bead_count;
+public:
+    // ORCA: past the maximum bead count, leave the extra thickness to the inner contour (infill) as soon as one more bead
+    // would be wanted, instead of widening the walls until there is room for a whole bead.
+    bool overflow_early { false };
     const BeadingStrategyPtr parent;
 };
 

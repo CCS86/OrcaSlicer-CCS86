@@ -20,6 +20,8 @@
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Arachne/utils/PolygonsPointIndex.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Arachne/BeadingStrategy/BeadingStrategyFactory.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionJunction.hpp"
 #include "libslic3r/Arachne/utils/SparsePointGrid.hpp"
@@ -57,12 +59,13 @@ WallToolPathsParams make_paths_params(const int layer_id, const PrintObjectConfi
         else
             input_params.min_length_factor = 0.5f;
 
+        // ORCA: in mm, or as a percentage of the nozzle diameter.
         if (layer_id == 0) {
-            if (const auto &initial_layer_min_bead_width_opt = print_object_config.initial_layer_min_bead_width)
-                input_params.min_bead_width = initial_layer_min_bead_width_opt.value * 0.01 * min_nozzle_diameter;
+            if (print_object_config.initial_layer_min_bead_width.value > 0.)
+                input_params.min_bead_width = float(print_object_config.initial_layer_min_bead_width.get_abs_value(min_nozzle_diameter));
         } else {
-            if (const auto &min_bead_width_opt = print_object_config.min_bead_width)
-                input_params.min_bead_width = min_bead_width_opt.value * 0.01 * min_nozzle_diameter;
+            if (print_object_config.min_bead_width.value > 0.)
+                input_params.min_bead_width = float(print_object_config.min_bead_width.get_abs_value(min_nozzle_diameter));
         }
 
         if (const auto &wall_transition_filter_deviation_opt = print_object_config.wall_transition_filter_deviation)
@@ -528,8 +531,10 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
 
     const coord_t wall_transition_length = scaled<coord_t>(this->m_params.wall_transition_length);
 	
-	const double wall_split_middle_threshold = std::clamp(2. * unscaled<double>(this->min_bead_width) / external_perimeter_extrusion_width - 1., 0.01, 0.99); // For an uneven nr. of lines: When to split the middle wall into two.
-    const double wall_add_middle_threshold   = std::clamp(unscaled<double>(this->min_bead_width) / perimeter_extrusion_width, 0.01, 0.99); // For an even nr. of lines: When to add a new middle in between the innermost two walls.
+	const double wall_split_middle_threshold = m_params.wall_split_middle_threshold > 0. ? m_params.wall_split_middle_threshold :
+        std::clamp(2. * unscaled<double>(this->min_bead_width) / external_perimeter_extrusion_width - 1., 0.01, 0.99); // For an uneven nr. of lines: When to split the middle wall into two.
+    const double wall_add_middle_threshold   = m_params.wall_add_middle_threshold > 0. ? m_params.wall_add_middle_threshold :
+        std::clamp(unscaled<double>(this->min_bead_width) / perimeter_extrusion_width, 0.01, 0.99); // For an even nr. of lines: When to add a new middle in between the innermost two walls.
     
     const int wall_distribution_count = this->m_params.wall_distribution_count;
     const size_t max_bead_count = (inset_count < std::numeric_limits<coord_t>::max() / 2) ? 2 * inset_count : std::numeric_limits<coord_t>::max();
@@ -546,7 +551,10 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
             wall_add_middle_threshold,
             max_bead_count,
             wall_0_inset,
-            wall_distribution_count
+            wall_distribution_count,
+            0.5,
+            m_params.overflow_early,
+            m_params.transition_thresholds
         );
     const coord_t transition_filter_dist   = scaled<coord_t>(100.f);
     const coord_t allowed_filter_deviation = wall_transition_filter_deviation;
@@ -896,6 +904,532 @@ WallToolPaths::ExtrusionLineSet WallToolPaths::getRegionOrder(const std::vector<
         }
     }
     return order_requirements;
+}
+
+
+// ORCA: nominal walls, see WallToolPaths.hpp.
+
+// Width at each point of a thick polyline: the two segment ends meeting there, averaged.
+static std::vector<double> point_widths(const ThickPolyline &tp)
+{
+    const size_t        n = tp.points.size();
+    std::vector<double> w(n);
+    for (size_t i = 0; i < n; ++ i)
+        w[i] = i == 0 ? tp.width[0] : i == n - 1 ? tp.width[2 * (n - 2) + 1] : 0.5 * (tp.width[2 * (i - 1) + 1] + tp.width[2 * i]);
+    return w;
+}
+
+// Where the width w of a center line passes cap: a wall of width opt on its left, at (w - wall width) / 2 from the old
+// centerline, and a filler on its right, at -wall width / 2, which together span exactly the old line's [-w/2, w/2].
+// Over ramp from where the width crosses cap the wall narrows from w to opt as it slides left and the filler grows
+// from nothing, so the wall never jumps sideways. Where the filler would be narrower than min_filler it is left out.
+static void split_center_line(const ThickPolyline &tp, double opt, double cap, double ramp, double min_filler,
+                              ThickPolylines &walls, ThickPolylines &fillers)
+{
+    struct V { Vec2d p; double w; };
+    std::vector<V> v;
+    {
+        const std::vector<double> w = point_widths(tp);
+        for (size_t i = 0; i < tp.points.size(); ++ i) {
+            const Vec2d p = tp.points[i].cast<double>();
+            if (! v.empty() && (v.back().p - p).norm() < 1.)
+                continue;
+            v.push_back({ p, w[i] });
+        }
+    }
+    const bool closed = tp.points.size() > 2 && tp.points.front() == tp.points.back();
+    if (v.size() < 2) {
+        walls.push_back(tp);
+        return;
+    }
+    if (closed && (v.front().p - v.back().p).norm() > 1.)
+        v.push_back(v.front());
+    bool any = false, all = true;
+    for (const V &x : v) {
+        any |= x.w > cap;
+        all &= x.w > cap;
+    }
+    if (! any) {
+        walls.push_back(tp);
+        return;
+    }
+    if (closed && ! all) {
+        // Start a closed line where it is not split, so that no split runs across its start.
+        v.pop_back();
+        size_t k = 0;
+        while (v[k].w > cap)
+            ++ k;
+        std::rotate(v.begin(), v.begin() + k, v.end());
+        v.push_back(v.front());
+    }
+    // The points where the width crosses cap.
+    std::vector<V> r{ v.front() };
+    for (size_t i = 1; i < v.size(); ++ i) {
+        const V &a = v[i - 1], &b = v[i];
+        if ((a.w > cap) != (b.w > cap)) {
+            const double t = (cap - a.w) / (b.w - a.w);
+            if (t > 1e-6 && t < 1. - 1e-6)
+                r.push_back({ a.p + (b.p - a.p) * t, cap });
+        }
+        r.push_back(b);
+    }
+    // Runs over cap, as first and last point, the crossings included.
+    auto runs_of = [cap](const std::vector<V> &pts) {
+        std::vector<std::pair<size_t, size_t>> runs;
+        for (size_t i = 0; i < pts.size(); ++ i) {
+            if (pts[i].w <= cap + 0.5)
+                continue;
+            size_t a = i, b = i;
+            while (a > 0 && pts[a - 1].w > cap - 0.5)
+                -- a;
+            while (b + 1 < pts.size() && pts[b + 1].w > cap - 0.5)
+                ++ b;
+            runs.emplace_back(a, b);
+            i = b;
+        }
+        return runs;
+    };
+    auto arc_lengths = [](const std::vector<V> &pts) {
+        std::vector<double> s(pts.size(), 0.);
+        for (size_t i = 1; i < pts.size(); ++ i)
+            s[i] = s[i - 1] + (pts[i].p - pts[i - 1].p).norm();
+        return s;
+    };
+    // A ramp only starts or ends at a crossing; a run that reaches the end of an open line stays split to its end.
+    auto is_crossing = [cap](const std::vector<V> &pts, size_t i) { return pts[i].w <= cap + 0.5; };
+    {
+        // Points where the ramps end, so that they end exactly a ramp length in.
+        const std::vector<double> s = arc_lengths(r);
+        std::vector<double>       cuts;
+        if (! (all && closed))
+            for (auto [a, b] : runs_of(r)) {
+                if (is_crossing(r, a) && s[a] + ramp < s[b])
+                    cuts.push_back(s[a] + ramp);
+                if (is_crossing(r, b) && s[b] - ramp > s[a])
+                    cuts.push_back(s[b] - ramp);
+            }
+        std::sort(cuts.begin(), cuts.end());
+        std::vector<V> rr{ r.front() };
+        size_t         c = 0;
+        for (size_t i = 1; i < r.size(); ++ i) {
+            for (; c < cuts.size() && cuts[c] < s[i] - 1.; ++ c)
+                if (cuts[c] > s[i - 1] + 1.) {
+                    const double t = (cuts[c] - s[i - 1]) / (s[i] - s[i - 1]);
+                    rr.push_back({ r[i - 1].p + (r[i].p - r[i - 1].p) * t, r[i - 1].w + (r[i].w - r[i - 1].w) * t });
+                }
+            rr.push_back(r[i]);
+        }
+        r.swap(rr);
+    }
+    const size_t              m = r.size();
+    const std::vector<double> s = arc_lengths(r);
+    // Offset direction at each point, to the left, mitred.
+    std::vector<Vec2d> sn(m - 1), vn(m);
+    for (size_t i = 0; i + 1 < m; ++ i) {
+        const Vec2d d = r[i + 1].p - r[i].p;
+        sn[i] = Vec2d(- d.y(), d.x()) / d.norm();
+    }
+    for (size_t i = 0; i < m; ++ i) {
+        const Vec2d  n0  = i > 0 ? sn[i - 1] : (closed ? sn[m - 2] : sn[0]);
+        const Vec2d  n1  = i + 1 < m ? sn[i] : (closed ? sn[0] : sn[m - 2]);
+        const Vec2d  sum = n0 + n1;
+        const double len = sum.norm();
+        vn[i] = len < 1e-9 ? n1 : Vec2d(sum / len / std::max((sum / len).dot(n1), 0.5));
+    }
+    // How far into its split each point is: 0 outside or at a crossing, 1 a ramp length or more inside.
+    const auto          runs = runs_of(r);
+    std::vector<double> beta(m, 0.);
+    for (auto [a, b] : runs)
+        for (size_t i = a; i <= b; ++ i) {
+            const double da = is_crossing(r, a) ? s[i] - s[a] : std::numeric_limits<double>::max();
+            const double db = is_crossing(r, b) ? s[b] - s[i] : std::numeric_limits<double>::max();
+            beta[i] = (all && closed) ? 1. : std::clamp(std::min(da, db) / ramp, 0., 1.);
+        }
+    // The wall narrows to opt over the ramp, and is never wider than cap: where the center line widens faster than the
+    // ramp narrows the wall, the filler takes the difference.
+    auto wall_width = [&](size_t i) {
+        double ww = std::min(cap, r[i].w - beta[i] * std::max(r[i].w - opt, 0.));
+        // Past the cap the filler is never narrower than min_filler: the wall gives up the difference.
+        if (r[i].w > cap - 0.5 && r[i].w - ww < min_filler)
+            ww = r[i].w - min_filler;
+        return ww;
+    };
+    ThickPolyline wall;
+    double        last_w = 0.;
+    for (size_t i = 0; i < m; ++ i) {
+        const double ww = wall_width(i);
+        const Vec2d  p  = r[i].p + vn[i] * (0.5 * (r[i].w - ww));
+        if (! wall.points.empty() && (p - wall.points.back().cast<double>()).norm() < 1.)
+            continue;
+        if (! wall.points.empty()) {
+            wall.width.push_back(last_w);
+            wall.width.push_back(ww);
+        }
+        wall.points.push_back(p.cast<coord_t>());
+        last_w = ww;
+    }
+    if (wall.points.size() >= 2)
+        walls.push_back(std::move(wall));
+    for (auto [a, b] : runs) {
+        ThickPolyline f;
+        double        fw_prev = 0.;
+        for (size_t i = a; i <= b; ++ i) {
+            const double ww = wall_width(i);
+            const double fw = r[i].w - ww;
+            if (fw < min_filler) {
+                // Narrower than a filler may be: left out, ending this filler or not yet starting one.
+                if (f.points.size() >= 2)
+                    fillers.push_back(std::move(f));
+                f = ThickPolyline();
+                continue;
+            }
+            const Vec2d  p  = r[i].p - vn[i] * (0.5 * ww);
+            if (! f.points.empty()) {
+                if ((p - f.points.back().cast<double>()).norm() < 1.)
+                    continue;
+                f.width.push_back(fw_prev);
+                f.width.push_back(fw);
+            }
+            f.points.push_back(p.cast<coord_t>());
+            fw_prev = fw;
+        }
+        if (f.points.size() >= 2)
+            fillers.push_back(std::move(f));
+    }
+}
+
+static ExtrusionLine to_extrusion_line(const ThickPolyline &tp, size_t inset_idx, bool is_odd, size_t perimeter_index)
+{
+    ExtrusionLine             line(inset_idx, is_odd);
+    const std::vector<double> w = point_widths(tp);
+    for (size_t i = 0; i < tp.points.size(); ++ i)
+        line.junctions.emplace_back(tp.points[i], coord_t(w[i]), perimeter_index);
+    line.is_closed = tp.points.size() > 2 && tp.points.front() == tp.points.back();
+    return line;
+}
+
+// The runs of a thick polyline at least min_width wide, each a polyline of its own.
+static ThickPolylines thick_runs_at_least(const ThickPolyline &tp, double min_width)
+{
+    ThickPolylines            out;
+    const std::vector<double> w = point_widths(tp);
+    ThickPolyline             run;
+    for (size_t i = 0; i < tp.points.size(); ++ i) {
+        if (w[i] < min_width) {
+            if (run.points.size() >= 2)
+                out.push_back(std::move(run));
+            run = ThickPolyline();
+            continue;
+        }
+        if (! run.points.empty()) {
+            run.width.push_back(w[i - 1]);
+            run.width.push_back(w[i]);
+        }
+        run.points.push_back(tp.points[i]);
+    }
+    if (run.points.size() >= 2)
+        out.push_back(std::move(run));
+    return out;
+}
+
+// The runs of a line at least min_width wide, each a line of its own.
+static VariableWidthLines runs_at_least(const ExtrusionLine &line, coord_t min_width)
+{
+    VariableWidthLines out;
+    ExtrusionLine      run(line.inset_idx, line.is_odd);
+    for (const ExtrusionJunction &j : line.junctions) {
+        if (j.w >= min_width) {
+            run.junctions.push_back(j);
+            continue;
+        }
+        if (run.junctions.size() >= 2)
+            out.push_back(run);
+        run.junctions.clear();
+    }
+    if (run.junctions.size() >= 2)
+        out.push_back(run);
+    for (ExtrusionLine &l : out)
+        l.is_closed = false;
+    return out;
+}
+
+ThickPolylines split_center_walls(std::vector<VariableWidthLines> &toolpaths, coord_t nominal_width, coord_t max_width, coord_t ramp_length,
+                                  coord_t min_filler_width, coord_t split_wall_width, bool narrow_center_lines_are_fillers)
+{
+    ThickPolylines fillers;
+    const double   opt        = double(nominal_width);
+    const double   cap        = std::max(double(max_width), opt);
+    const double   min_filler = std::max(double(min_filler_width), scaled<double>(0.02));
+    auto is_center = [](const ExtrusionLine &l) { return l.is_odd && l.inset_idx > 0 && l.junctions.size() >= 2; };
+    auto key       = [](const Point &p) { return std::make_pair(p.x(), p.y()); };
+
+    // Where center lines end, taken before their thin ends are dropped below: lines meet there.
+    Points center_end_points;
+    for (const VariableWidthLines &lines : toolpaths)
+        for (const ExtrusionLine &l : lines)
+            if (is_center(l)) {
+                center_end_points.push_back(l.junctions.front().p);
+                center_end_points.push_back(l.junctions.back().p);
+            }
+    const double match_dist = 0.25 * opt;
+    auto at_center_end = [&](const Point &p) {
+        for (const Point &q : center_end_points)
+            if ((q - p).cast<double>().norm() < match_dist)
+                return true;
+        return false;
+    };
+
+    // With the slack all in the center line, Arachne's transitions thin a center line towards nothing, even below:
+    // the parts narrower than a filler may be are dropped.
+    for (VariableWidthLines &lines : toolpaths) {
+        bool thin = false;
+        for (const ExtrusionLine &l : lines)
+            if (is_center(l))
+                for (const ExtrusionJunction &j : l.junctions)
+                    thin |= j.w < coord_t(min_filler);
+        if (! thin)
+            continue;
+        VariableWidthLines out;
+        for (ExtrusionLine &l : lines) {
+            bool l_thin = false;
+            if (is_center(l))
+                for (const ExtrusionJunction &j : l.junctions)
+                    l_thin |= j.w < coord_t(min_filler);
+            if (l_thin)
+                append(out, runs_at_least(l, coord_t(min_filler)));
+            else
+                out.push_back(std::move(l));
+        }
+        lines = std::move(out);
+    }
+
+    // The lines that take over where a center line ends start there too, flaring from its full width: they start a
+    // junction later, in their own lanes. A closed line that started and ended there becomes open.
+    std::vector<std::pair<coord_t, coord_t>> arm_ends;
+    for (VariableWidthLines &lines : toolpaths)
+        for (ExtrusionLine &l : lines) {
+            if (l.is_odd || l.inset_idx == 0 || l.junctions.size() < 3)
+                continue;
+            const bool trim_front = at_center_end(l.junctions.front().p);
+            const bool trim_back  = at_center_end(l.junctions.back().p);
+            if (trim_back && l.junctions.size() >= 3) {
+                l.junctions.pop_back();
+                l.is_closed = false;
+                arm_ends.push_back(key(l.junctions.back().p));
+            }
+            if (trim_front && l.junctions.size() >= 3) {
+                l.junctions.erase(l.junctions.begin());
+                l.is_closed = false;
+                arm_ends.push_back(key(l.junctions.front().p));
+            }
+            // The flare runs on over the transition: near a trimmed end, a line is no wider than it settles to.
+            for (int end = 0; end < 2; ++ end) {
+                if (! (end ? trim_back : trim_front))
+                    continue;
+                const size_t n = l.junctions.size();
+                auto at = [&](size_t i) -> ExtrusionJunction & { return l.junctions[end ? n - 1 - i : i]; };
+                double dist = 0.;
+                size_t i    = 1;
+                for (; i < n && dist < 2. * opt; ++ i)
+                    dist += (at(i).p - at(i - 1).p).cast<double>().norm();
+                const coord_t settled = at(std::min(i, n - 1)).w;
+                for (size_t k = 0; k < std::min(i, n); ++ k)
+                    at(k).w = std::min(at(k).w, settled);
+            }
+        }
+    // A pair can also run into a center line's end and straight back out, as one line folded there: the fold takes the
+    // center line's full width and flares out on both sides. It is capped the same way, on each side.
+    for (VariableWidthLines &lines : toolpaths)
+        for (ExtrusionLine &l : lines) {
+            const size_t n = l.junctions.size();
+            if (l.is_odd || l.inset_idx == 0 || n < 3)
+                continue;
+            for (size_t f = 1; f + 1 < n; ++ f) {
+                if (! at_center_end(l.junctions[f].p))
+                    continue;
+                coord_t settled[2];
+                size_t  reach[2];
+                for (int dir = 0; dir < 2; ++ dir) {
+                    double dist = 0.;
+                    size_t i    = f;
+                    while (dist < 2. * opt && (dir ? i + 1 < n : i > 0)) {
+                        const size_t next = dir ? i + 1 : i - 1;
+                        dist += (l.junctions[next].p - l.junctions[i].p).cast<double>().norm();
+                        i = next;
+                    }
+                    settled[dir] = l.junctions[i].w;
+                    reach[dir]   = i;
+                }
+                for (size_t i = reach[0]; i < f; ++ i)
+                    l.junctions[i].w = std::min(l.junctions[i].w, settled[0]);
+                for (size_t i = f + 1; i <= reach[1]; ++ i)
+                    l.junctions[i].w = std::min(l.junctions[i].w, settled[1]);
+                l.junctions[f].w = std::min(l.junctions[f].w, std::max(settled[0], settled[1]));
+            }
+        }
+    std::sort(arm_ends.begin(), arm_ends.end());
+
+    // Split the center lines. Walls out of a split are marked, to join them below.
+    std::vector<std::vector<bool>> split_wall(toolpaths.size());
+    for (size_t k = 0; k < toolpaths.size(); ++ k) {
+        VariableWidthLines out;
+        for (ExtrusionLine &l : toolpaths[k]) {
+            if (! is_center(l)) {
+                out.push_back(std::move(l));
+                split_wall[k].push_back(false);
+                continue;
+            }
+            ThickPolylines walls, f;
+            split_center_line(to_thick_polyline(l), std::min(double(split_wall_width), cap), cap, double(ramp_length), min_filler, walls, f);
+            append(fillers, std::move(f));
+            for (ThickPolyline &w : walls) {
+                bool narrow = narrow_center_lines_are_fillers;
+                for (const coordf_t width : w.width)
+                    narrow &= width < opt;
+                if (narrow) {
+                    fillers.push_back(std::move(w));
+                    continue;
+                }
+                out.push_back(to_extrusion_line(w, l.inset_idx, true, l.junctions.front().perimeter_index));
+                split_wall[k].push_back(true);
+            }
+        }
+        toolpaths[k] = std::move(out);
+    }
+
+    // A wall out of a split continues, where its center line ended at a transition, into the line that takes over in
+    // its lane: the nearest trimmed end, within a line width.
+    const double join_dist = 1.5 * opt;
+    for (size_t k = 0; k < toolpaths.size(); ++ k) {
+        VariableWidthLines &lines = toolpaths[k];
+        for (size_t i = 0; i < lines.size(); ++ i) {
+            if (! split_wall[k][i] || lines[i].junctions.size() < 2 || lines[i].is_closed)
+                continue;
+            for (int end = 0; end < 2; ++ end) {
+                ExtrusionLine &w  = lines[i];
+                const Point    we = end ? w.junctions.back().p : w.junctions.front().p;
+                double         best = join_dist;
+                size_t         bj   = 0;
+                bool           bfront = true;
+                for (size_t j = 0; j < lines.size(); ++ j) {
+                    if (j == i || lines[j].is_odd || lines[j].junctions.size() < 2)
+                        continue;
+                    for (int ae = 0; ae < 2; ++ ae) {
+                        const Point &p = ae ? lines[j].junctions.back().p : lines[j].junctions.front().p;
+                        if (! std::binary_search(arm_ends.begin(), arm_ends.end(), key(p)))
+                            continue;
+                        const double d = (p - we).cast<double>().norm();
+                        if (d < best) {
+                            best   = d;
+                            bj     = j;
+                            bfront = ae == 0;
+                        }
+                    }
+                }
+                if (best >= join_dist)
+                    continue;
+                ExtrusionLine &a = lines[bj];
+                if (! bfront)
+                    std::reverse(a.junctions.begin(), a.junctions.end());
+                if (! end)
+                    std::reverse(w.junctions.begin(), w.junctions.end());
+                w.junctions.insert(w.junctions.end(), a.junctions.begin(), a.junctions.end());
+                w.is_odd = false;
+                a.junctions.clear();
+                if (! end)
+                    std::reverse(w.junctions.begin(), w.junctions.end());
+            }
+        }
+        lines.erase(std::remove_if(lines.begin(), lines.end(), [](const ExtrusionLine &l) { return l.junctions.size() < 2; }), lines.end());
+    }
+    // No wall inside the outer walls wider than the maximum: where Arachne still flares one past it, the flare lies
+    // over lines that cover that place already.
+    for (VariableWidthLines &lines : toolpaths)
+        for (ExtrusionLine &l : lines)
+            if (l.inset_idx > 0)
+                for (ExtrusionJunction &j : l.junctions)
+                    j.w = std::min(j.w, coord_t(cap));
+    // Nor any filler narrower than the minimum.
+    ThickPolylines out;
+    for (const ThickPolyline &f : fillers)
+        append(out, thick_runs_at_least(f, min_filler));
+    return out;
+}
+
+ThickPolylines narrow_infill_strips(ExPolygons &infill_contour, coord_t min_infill_width, double min_width, double max_width)
+{
+    // Only regions narrow all over: the narrow corners of a region with room for infill are left to the infill.
+    ThickPolylines out;
+    ExPolygons     keep;
+    for (ExPolygon &region : infill_contour) {
+        if (offset_ex(region, - float(min_infill_width / 2.)).empty()) {
+            // Simplified first, as for gap fill: the inner contour's fine detail breaks the medial axis into pieces.
+            ExPolygon simplified = region;
+            simplified.douglas_peucker(scaled<double>(0.0125));
+            simplified.medial_axis(min_width, max_width, &out);
+        }
+        else
+            keep.push_back(std::move(region));
+    }
+    infill_contour = std::move(keep);
+    ThickPolylines trimmed;
+    for (const ThickPolyline &t : out)
+        append(trimmed, thick_runs_at_least(t, min_width));
+    return trimmed;
+}
+
+
+// The area a thick polyline's lines cover: a quad per segment and a disc at each point, so that lines meeting at an
+// angle or ending leave no hairline open.
+static Polygons thick_polyline_cover(const ThickPolyline &tp)
+{
+    Polygons                  out;
+    const std::vector<double> w = point_widths(tp);
+    for (size_t i = 0; i + 1 < tp.points.size(); ++ i) {
+        const Vec2d  a = tp.points[i].cast<double>(), b = tp.points[i + 1].cast<double>(), d = b - a;
+        const double len = d.norm();
+        if (len < 1.)
+            continue;
+        const Vec2d n(- d.y() / len, d.x() / len);
+        Polygon quad({ (a + n * (0.5 * w[i])).cast<coord_t>(), (b + n * (0.5 * w[i + 1])).cast<coord_t>(),
+                       (b - n * (0.5 * w[i + 1])).cast<coord_t>(), (a - n * (0.5 * w[i])).cast<coord_t>() });
+        quad.make_counter_clockwise();
+        out.emplace_back(std::move(quad));
+    }
+    for (size_t i = 0; i < tp.points.size(); ++ i)
+        if (w[i] > 0.) {
+            Polygon disc;
+            for (int k = 0; k < 12; ++ k) {
+                const double angle = 2. * PI * k / 12.;
+                disc.points.emplace_back((tp.points[i].cast<double>() + Vec2d(cos(angle), sin(angle)) * (0.5 * w[i])).cast<coord_t>());
+            }
+            out.emplace_back(std::move(disc));
+        }
+    return out;
+}
+
+ThickPolylines fill_uncovered(const Polygons &outline, const std::vector<VariableWidthLines> &toolpaths, const ThickPolylines &fillers,
+                              const ExPolygons &infill_contour, double min_width, double max_width)
+{
+    Polygons covered = to_polygons(infill_contour);
+    for (const VariableWidthLines &lines : toolpaths)
+        for (const ExtrusionLine &l : lines)
+            if (l.junctions.size() >= 2)
+                append(covered, thick_polyline_cover(to_thick_polyline(l)));
+    for (const ThickPolyline &f : fillers)
+        append(covered, thick_polyline_cover(f));
+    // Grown a little, so that the seams between lines are not taken for unfilled; the opening drops the hairlines left.
+    ExPolygons     unfilled = opening_ex(diff_ex(outline, offset(covered, float(scaled<double>(0.01)))), float(min_width / 2.));
+    ThickPolylines lines;
+    for (ExPolygon &area : unfilled) {
+        area.douglas_peucker(scaled<double>(0.0125));
+        // Not only where the sides are near parallel: what is left unfilled is often a wedge.
+        area.medial_axis(min_width, max_width, &lines, false);
+    }
+    ThickPolylines out;
+    for (const ThickPolyline &t : lines)
+        append(out, thick_runs_at_least(t, min_width));
+    return out;
 }
 
 } // namespace Slic3r::Arachne

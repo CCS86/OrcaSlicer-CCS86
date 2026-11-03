@@ -108,7 +108,8 @@ coord_t LimitedBeadingStrategy::getTransitionThickness(coord_t lower_bead_count)
         return parent->getTransitionThickness(lower_bead_count);
 
     if (lower_bead_count == max_bead_count)
-        return parent->getOptimalThickness(lower_bead_count + 1) - scaled<coord_t>(0.01);
+        return overflow_early ? parent->getTransitionThickness(lower_bead_count) :
+                                parent->getOptimalThickness(lower_bead_count + 1) - scaled<coord_t>(0.01);
 
     assert(false);
     return scaled<coord_t>(900.); // 0.9 meter;
@@ -120,7 +121,7 @@ coord_t LimitedBeadingStrategy::getOptimalBeadCount(coord_t thickness) const
     if (parent_bead_count <= max_bead_count) {
         return parent->getOptimalBeadCount(thickness);
     } else if (parent_bead_count == max_bead_count + 1) {
-        if (thickness < parent->getOptimalThickness(max_bead_count + 1) - scaled<coord_t>(0.01))
+        if (! overflow_early && thickness < parent->getOptimalThickness(max_bead_count + 1) - scaled<coord_t>(0.01))
             return max_bead_count;
         else 
             return max_bead_count + 1;

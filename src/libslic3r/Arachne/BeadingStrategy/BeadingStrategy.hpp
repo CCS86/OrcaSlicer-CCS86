@@ -95,6 +95,11 @@ public:
     virtual std::string toString() const;
 
     double  getSplitMiddleThreshold() const;
+
+    // ORCA: thresholds by lower bead count, overriding the two below for the counts they cover: the transition from n beads
+    // to n + 1 lies at thresholds[n] of the way. Empty: the two below, by the count's parity.
+    void    setCountThresholds(std::vector<double> thresholds);
+    double  thresholdFor(coord_t lower_bead_count) const;
     double  getTransitioningAngle() const;
 
 protected:
@@ -105,6 +110,7 @@ protected:
     double  wall_split_middle_threshold; //! Threshold when a middle wall should be split into two, as a ratio of the optimal wall width.
 
     double  wall_add_middle_threshold; //! Threshold when a new middle wall should be added between an even number of walls, as a ratio of the optimal wall width.
+    std::vector<double> count_thresholds; //! ORCA: see setCountThresholds().
 
     coord_t default_transition_length; //! The length of the region to smoothly transfer between bead counts
 
