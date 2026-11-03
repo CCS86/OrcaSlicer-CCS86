@@ -16,6 +16,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionLine.hpp"
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Arachne/utils/PolygonsPointIndex.hpp"
@@ -553,7 +554,6 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
             wall_0_inset,
             wall_distribution_count,
             0.5,
-            m_params.overflow_early,
             m_params.transition_thresholds
         );
     const coord_t transition_filter_dist   = scaled<coord_t>(100.f);
@@ -907,7 +907,32 @@ WallToolPaths::ExtrusionLineSet WallToolPaths::getRegionOrder(const std::vector<
 }
 
 
-// ORCA: nominal walls, see WallToolPaths.hpp.
+// ORCA: wall width limits, see WallToolPaths.hpp.
+
+void set_wall_width_limits(WallToolPathsParams &params, double inner_spacing, double min_spacing, double max_spacing, size_t wall_count)
+{
+    const double min_wall = std::max(min_spacing, 0.01);
+    const double max_wall = std::max(max_spacing, inner_spacing);
+    // The transition filter keeps two walls on through a short narrowing, up to its margin narrower than where they
+    // split: the split allows for it, so that the minimum holds there too.
+    const double filter_margin = std::max(double(params.wall_transition_filter_deviation), 0.);
+    params.wall_split_middle_threshold = std::clamp(2. * (min_wall + filter_margin) / inner_spacing - 1., 0.01, 0.99);
+    params.wall_add_middle_threshold   = std::clamp(std::min(min_wall / inner_spacing, 2. * (max_wall / inner_spacing - 1.)), 0.01, 0.99);
+    // From n inner walls to n + 1 where both are as far from the inner wall width: n / (2n + 1) of the way. Within the
+    // limits: the n + 1 walls no narrower than the minimum (with the filter's margin), the n no wider than the maximum;
+    // where the two conflict the minimum holds. From none to one, once the new wall can be the minimum.
+    const double rho = (min_wall + filter_margin) / inner_spacing;
+    const double r   = max_wall / inner_spacing;
+    std::vector<double> thresholds(2 * std::max(wall_count, size_t(1)) + 2);
+    thresholds[0] = std::clamp(min_wall / inner_spacing, 0.01, 0.99);
+    for (size_t n = 1; n < thresholds.size(); ++ n) {
+        const double lo       = double(n + 1) * rho - double(n);
+        const double hi       = double(n) * (r - 1.);
+        const double balanced = double(n) / double(2 * n + 1);
+        thresholds[n]         = std::clamp(lo > hi ? lo : std::clamp(balanced, lo, hi), 0.01, 0.99);
+    }
+    params.transition_thresholds = std::move(thresholds);
+}
 
 // Width at each point of a thick polyline: the two segment ends meeting there, averaged.
 static std::vector<double> point_widths(const ThickPolyline &tp)
@@ -1154,7 +1179,7 @@ static VariableWidthLines runs_at_least(const ExtrusionLine &line, coord_t min_w
 }
 
 ThickPolylines split_center_walls(std::vector<VariableWidthLines> &toolpaths, coord_t nominal_width, coord_t max_width, coord_t ramp_length,
-                                  coord_t min_filler_width, coord_t split_wall_width, bool narrow_center_lines_are_fillers)
+                                  coord_t min_filler_width)
 {
     ThickPolylines fillers;
     const double   opt        = double(nominal_width);
@@ -1179,8 +1204,7 @@ ThickPolylines split_center_walls(std::vector<VariableWidthLines> &toolpaths, co
         return false;
     };
 
-    // With the slack all in the center line, Arachne's transitions thin a center line towards nothing, even below:
-    // the parts narrower than a filler may be are dropped.
+    // Arachne's transitions thin a center line towards nothing: the parts narrower than a filler may be are dropped.
     for (VariableWidthLines &lines : toolpaths) {
         bool thin = false;
         for (const ExtrusionLine &l : lines)
@@ -1280,16 +1304,9 @@ ThickPolylines split_center_walls(std::vector<VariableWidthLines> &toolpaths, co
                 continue;
             }
             ThickPolylines walls, f;
-            split_center_line(to_thick_polyline(l), std::min(double(split_wall_width), cap), cap, double(ramp_length), min_filler, walls, f);
+            split_center_line(to_thick_polyline(l), cap, cap, double(ramp_length), min_filler, walls, f);
             append(fillers, std::move(f));
             for (ThickPolyline &w : walls) {
-                bool narrow = narrow_center_lines_are_fillers;
-                for (const coordf_t width : w.width)
-                    narrow &= width < opt;
-                if (narrow) {
-                    fillers.push_back(std::move(w));
-                    continue;
-                }
                 out.push_back(to_extrusion_line(w, l.inset_idx, true, l.junctions.front().perimeter_index));
                 split_wall[k].push_back(true);
             }
@@ -1378,58 +1395,5 @@ ThickPolylines narrow_infill_strips(ExPolygons &infill_contour, coord_t min_infi
     return trimmed;
 }
 
-
-// The area a thick polyline's lines cover: a quad per segment and a disc at each point, so that lines meeting at an
-// angle or ending leave no hairline open.
-static Polygons thick_polyline_cover(const ThickPolyline &tp)
-{
-    Polygons                  out;
-    const std::vector<double> w = point_widths(tp);
-    for (size_t i = 0; i + 1 < tp.points.size(); ++ i) {
-        const Vec2d  a = tp.points[i].cast<double>(), b = tp.points[i + 1].cast<double>(), d = b - a;
-        const double len = d.norm();
-        if (len < 1.)
-            continue;
-        const Vec2d n(- d.y() / len, d.x() / len);
-        Polygon quad({ (a + n * (0.5 * w[i])).cast<coord_t>(), (b + n * (0.5 * w[i + 1])).cast<coord_t>(),
-                       (b - n * (0.5 * w[i + 1])).cast<coord_t>(), (a - n * (0.5 * w[i])).cast<coord_t>() });
-        quad.make_counter_clockwise();
-        out.emplace_back(std::move(quad));
-    }
-    for (size_t i = 0; i < tp.points.size(); ++ i)
-        if (w[i] > 0.) {
-            Polygon disc;
-            for (int k = 0; k < 12; ++ k) {
-                const double angle = 2. * PI * k / 12.;
-                disc.points.emplace_back((tp.points[i].cast<double>() + Vec2d(cos(angle), sin(angle)) * (0.5 * w[i])).cast<coord_t>());
-            }
-            out.emplace_back(std::move(disc));
-        }
-    return out;
-}
-
-ThickPolylines fill_uncovered(const Polygons &outline, const std::vector<VariableWidthLines> &toolpaths, const ThickPolylines &fillers,
-                              const ExPolygons &infill_contour, double min_width, double max_width)
-{
-    Polygons covered = to_polygons(infill_contour);
-    for (const VariableWidthLines &lines : toolpaths)
-        for (const ExtrusionLine &l : lines)
-            if (l.junctions.size() >= 2)
-                append(covered, thick_polyline_cover(to_thick_polyline(l)));
-    for (const ThickPolyline &f : fillers)
-        append(covered, thick_polyline_cover(f));
-    // Grown a little, so that the seams between lines are not taken for unfilled; the opening drops the hairlines left.
-    ExPolygons     unfilled = opening_ex(diff_ex(outline, offset(covered, float(scaled<double>(0.01)))), float(min_width / 2.));
-    ThickPolylines lines;
-    for (ExPolygon &area : unfilled) {
-        area.douglas_peucker(scaled<double>(0.0125));
-        // Not only where the sides are near parallel: what is left unfilled is often a wedge.
-        area.medial_axis(min_width, max_width, &lines, false);
-    }
-    ThickPolylines out;
-    for (const ThickPolyline &t : lines)
-        append(out, thick_runs_at_least(t, min_width));
-    return out;
-}
 
 } // namespace Slic3r::Arachne

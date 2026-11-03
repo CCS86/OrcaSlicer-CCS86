@@ -8780,7 +8780,7 @@ void PrintConfigDef::init_fff_params()
     def->max = 10;
     def->set_default_value(new ConfigOptionPercent(0));
 
-    def = this->add("nominal_walls", coBool);
+    def = this->add("wall_width_limits", coBool);
     def->label = L("Wall width limits (experimental)");
     def->category = L("Quality");
     def->tooltip = L("Limits the widths Arachne gives its walls. Walls widen up to the maximum wall width before another wall "
@@ -8788,11 +8788,12 @@ void PrintConfigDef::init_fff_params()
                      "side by side. Where one wall would pass the maximum before two could be wide enough (a maximum below "
                      "twice the minimum wall width), it is split into a wall and a narrow filler, printed after the walls "
                      "as gap fill. Also removes the extra width Arachne gives walls where their number changes, and fills "
-                     "strips left between walls that are too narrow for infill.");
+                     "strips left between walls that are too narrow for infill.\n\n"
+                     "The narrowest walls side by side may get is the minimum wall width.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
-    def = this->add("nominal_walls_max_width", coFloatOrPercent);
+    def = this->add("max_bead_width", coFloatOrPercent);
     def->label = L("Maximum wall width");
     def->category = L("Quality");
     def->tooltip = L("With wall width limits: the widest a wall inside the outer walls may get. If expressed as a percentage, "
@@ -8806,9 +8807,9 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(135, true));
+    def->set_default_value(new ConfigOptionFloatOrPercent(150, true));
 
-    def = this->add("nominal_walls_min_filler_width", coFloatOrPercent);
+    def = this->add("min_wall_filler_width", coFloatOrPercent);
     def->label = L("Minimum filler width");
     def->category = L("Quality");
     def->tooltip = L("With wall width limits: the narrowest filler printed. Where a filler would be narrower, the wall beside it "

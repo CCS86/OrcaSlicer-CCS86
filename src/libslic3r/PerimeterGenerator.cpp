@@ -2849,40 +2849,13 @@ void PerimeterGenerator::process_arachne()
             Arachne::WallToolPathsParams input_params = Arachne::make_paths_params(this->layer_id, *object_config, *print_config);
             // Set params is_top_or_bottom_layer for adjusting short-wall removal sensitivity.
             input_params.is_top_or_bottom_layer = (is_bottom_layer || is_topmost_layer) ? true : false;
-            // ORCA: wall width limits. Walls widen up to the maximum wall width before another is added, and a transition
-            // leaves no walls side by side narrower than the minimum wall width: a middle wall splits into two once each
-            // half is that wide, and one is added between two once it can be that wide and they would otherwise pass the
-            // maximum. Widths are spacings, against the inner wall's, as the walls they change are inner walls. Where one
-            // wall would pass the maximum before two could be wide enough, Arachne::split_center_walls() splits it after
-            // the fact into a wall and a filler.
-            const bool nominal_walls = object_config->nominal_walls.value;
-            if (nominal_walls) {
-                const double nozzle_diameter = this->perimeter_flow.nozzle_diameter();
-                const double spacing_offset  = this->layer_height * (1. - 0.25 * PI);
-                const double inner           = unscaled(perimeter_spacing);
-                const double min_wall        = std::max(double(input_params.min_bead_width) - spacing_offset, 0.01);
-                const double max_wall        = std::max(object_config->nominal_walls_max_width.get_abs_value(nozzle_diameter) - spacing_offset, inner);
-                // The transition filter keeps two walls on through a short narrowing, up to its margin narrower than where
-                // they split: the split allows for it, so that the minimum holds there too.
-                const double filter_margin   = std::max(double(input_params.wall_transition_filter_deviation), 0.);
-                input_params.wall_split_middle_threshold = std::clamp(2. * (min_wall + filter_margin) / inner - 1., 0.01, 0.99);
-                input_params.wall_add_middle_threshold   = std::clamp(std::min(min_wall / inner, 2. * (max_wall / inner - 1.)), 0.01, 0.99);
-                // From n inner walls to n + 1 where both are as far from the inner wall width: n / (2n + 1) of the way.
-                // Within the limits: the n + 1 walls no narrower than the minimum (with the filter's margin), the n no
-                // wider than the maximum; where the two conflict the minimum holds, a single wall too wide being split
-                // into a wall and a filler afterwards. From none to one, once the new wall can be the minimum.
-                const double rho = (min_wall + filter_margin) / inner;
-                const double r   = max_wall / inner;
-                std::vector<double> thresholds(2 * size_t(std::max(loop_number + 1, 1)) + 2);
-                thresholds[0] = std::clamp(min_wall / inner, 0.01, 0.99);
-                for (size_t n = 1; n < thresholds.size(); ++ n) {
-                    const double lo       = double(n + 1) * rho - double(n);
-                    const double hi       = double(n) * (r - 1.);
-                    const double balanced = double(n) / double(2 * n + 1);
-                    thresholds[n] = std::clamp(lo > hi ? lo : std::clamp(balanced, lo, hi), 0.01, 0.99);
-                }
-                input_params.transition_thresholds = std::move(thresholds);
-            }
+            // ORCA: wall width limits. Widths are spacings, against the inner wall's, as the walls they change are inner walls.
+            const bool   wall_width_limits = object_config->wall_width_limits.value;
+            const double spacing_offset    = this->layer_height * (1. - 0.25 * PI);
+            const double max_wall_spacing  = object_config->max_bead_width.get_abs_value(this->perimeter_flow.nozzle_diameter()) - spacing_offset;
+            if (wall_width_limits)
+                Arachne::set_wall_width_limits(input_params, unscaled(perimeter_spacing), double(input_params.min_bead_width) - spacing_offset,
+                                               max_wall_spacing, size_t(std::max(loop_number + 1, 1)));
 
             coord_t wall_0_inset = 0;
             if (apply_precise_outer_wall)
@@ -3039,13 +3012,11 @@ void PerimeterGenerator::process_arachne()
 
             // ORCA: wall width limits: center lines are split where too wide, and the fillers, with the strips of the
             // inner contour too narrow for infill, are printed as gap fill, after the walls.
-            if (nominal_walls) {
-                const double   nozzle_diameter = this->perimeter_flow.nozzle_diameter();
-                const double   spacing_offset  = this->layer_height * (1. - 0.25 * PI);
-                const coord_t  max_wall        = scaled<coord_t>(std::max(object_config->nominal_walls_max_width.get_abs_value(nozzle_diameter) - spacing_offset, 0.01));
-                const coord_t  min_filler      = scaled<coord_t>(std::max(object_config->nominal_walls_min_filler_width.get_abs_value(nozzle_diameter) - spacing_offset, 0.01));
-                ThickPolylines fillers         = Arachne::split_center_walls(perimeters, perimeter_spacing, max_wall, scaled<coord_t>(0.5), min_filler,
-                                                                             max_wall, false);
+            if (wall_width_limits) {
+                const coord_t  max_wall   = scaled<coord_t>(std::max(max_wall_spacing, 0.01));
+                const coord_t  min_filler = scaled<coord_t>(std::max(object_config->min_wall_filler_width.get_abs_value(this->perimeter_flow.nozzle_diameter()) -
+                                                                         spacing_offset, 0.01));
+                ThickPolylines fillers    = Arachne::split_center_walls(perimeters, perimeter_spacing, max_wall, scaled<coord_t>(0.5), min_filler);
                 append(fillers, Arachne::narrow_infill_strips(infill_contour, perimeter_spacing, double(min_filler), 2. * double(perimeter_spacing)));
                 if (this->config->filter_out_gap_fill.value > 0.)
                     fillers.erase(std::remove_if(fillers.begin(), fillers.end(),

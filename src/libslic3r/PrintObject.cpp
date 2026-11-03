@@ -1798,9 +1798,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "wall_maximum_resolution"
             || opt_key == "wall_maximum_deviation"
             || opt_key == "wall_width_tolerance"
-            || opt_key == "nominal_walls"
-            || opt_key == "nominal_walls_max_width"
-            || opt_key == "nominal_walls_min_filler_width"
+            || opt_key == "wall_width_limits"
+            || opt_key == "max_bead_width"
+            || opt_key == "min_wall_filler_width"
             || opt_key == "min_feature_size"
             || opt_key == "min_length_factor"
             || opt_key == "min_bead_width") {

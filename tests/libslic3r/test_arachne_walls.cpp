@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/catch_message.hpp>
+#include "libslic3r/Arachne/BeadingStrategy/DistributedBeadingStrategy.hpp"
 #include "libslic3r/Arachne/WallToolPaths.hpp"
 #include "libslic3r/Arachne/SkeletalTrapezoidation.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionLine.hpp"
@@ -31,6 +32,8 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/Line.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -389,4 +392,151 @@ TEST_CASE("Fuzzy skin displacement mode leaves widths untouched", "[Arachne][Fuz
 
     REQUIRE(loop.size() > 100);
     CHECK(std::all_of(loop.begin(), loop.end(), [width](const auto& j) { return j.w == width; }));
+}
+
+TEST_CASE("Bead count thresholds can be set for each bead count", "[Arachne]") {
+    // A strategy steps from n beads to n + 1 once the width left past n full beads reaches a threshold, as a fraction of
+    // the bead width. By default there is one threshold for an odd n and one for an even n; setCountThresholds() sets one
+    // for each n, as wall width limits do.
+    const size_t  n         = GENERATE(1, 2, 3, 4);
+    const double  threshold = GENERATE(0.2, 0.45, 0.8);
+    const coord_t width     = scaled<coord_t>(0.4);
+
+    DistributedBeadingStrategy strategy(width, width, PI / 4., 0.9, 0.9, 1);
+    std::vector<double>        thresholds(6, 0.9);
+    thresholds[n] = threshold;
+    strategy.setCountThresholds(thresholds);
+
+    const coord_t step = coord_t(n) * width + coord_t(threshold * double(width));
+    INFO(n << " beads, threshold " << threshold);
+    CHECK(strategy.getTransitionThickness(coord_t(n)) == step);
+    CHECK(strategy.getOptimalBeadCount(step - scaled<coord_t>(0.01)) == coord_t(n));
+    CHECK(strategy.getOptimalBeadCount(step + scaled<coord_t>(0.01)) == coord_t(n + 1));
+}
+
+TEST_CASE("Wall width limits keep inner walls between the minimum and maximum width", "[Arachne]") {
+    // Straight strips, cut across the middle, widening through one to four inner walls a side. With wall width limits no
+    // inner wall is wider than the maximum or narrower than the minimum wall width, and what the walls cannot cover
+    // within those limits is left to fillers, no narrower than the minimum filler width.
+    const double strip_width = GENERATE(1.1, 1.25, 1.4, 1.55, 1.7, 1.85, 2.0, 2.15, 2.3, 2.45, 2.6, 2.75, 2.9, 3.05, 3.2, 3.35);
+
+    // Widths are spacings: line width less the rounded sides of a 0.28 mm layer.
+    constexpr double layer_height   = 0.28;
+    const double     spacing_offset = layer_height * (1. - 0.25 * PI);
+    const double     inner_spacing  = 0.45 - spacing_offset;
+    WallToolPathsParams params      = make_bbl_x1c_028_params(85);
+    const double     min_spacing    = double(params.min_bead_width) - spacing_offset;
+    const double     max_spacing    = 0.65 - spacing_offset;
+    const double     filler_spacing = 0.15 - spacing_offset;
+    set_wall_width_limits(params, inner_spacing, min_spacing, max_spacing, 5);
+
+    const Polygons outline{ Polygon({ Point::new_scale(0., 0.), Point::new_scale(20., 0.), Point::new_scale(20., strip_width),
+                                      Point::new_scale(0., strip_width) }) };
+    WallToolPaths walls(outline, scaled<coord_t>(0.42 - spacing_offset), scaled<coord_t>(inner_spacing), 5, 0, layer_height, params);
+    std::vector<VariableWidthLines> toolpaths = walls.getToolPaths();
+    const ThickPolylines fillers = split_center_walls(toolpaths, scaled<coord_t>(inner_spacing), scaled<coord_t>(max_spacing),
+                                                      scaled<coord_t>(0.5), scaled<coord_t>(filler_spacing));
+
+    // The widths where lines cross x = 10 mm.
+    const auto width_at_middle = [](const Point &a, const Point &b, double wa, double wb, std::vector<double> &out) {
+        const double x = scaled<double>(10.), xa = double(a.x()), xb = double(b.x());
+        if ((xa - x) * (xb - x) <= 0. && xa != xb)
+            out.push_back(unscaled(wa + (wb - wa) * (x - xa) / (xb - xa)));
+    };
+    std::vector<double> inner_walls, filler_widths;
+    for (const VariableWidthLines &lines : toolpaths)
+        for (const ExtrusionLine &line : lines)
+            if (line.inset_idx > 0)
+                for (size_t i = 1; i < line.junctions.size(); ++ i)
+                    width_at_middle(line.junctions[i - 1].p, line.junctions[i].p, double(line.junctions[i - 1].w), double(line.junctions[i].w), inner_walls);
+    for (const ThickPolyline &filler : fillers)
+        for (const ThickLine &line : filler.thicklines())
+            width_at_middle(line.a, line.b, line.a_width, line.b_width, filler_widths);
+
+    INFO("strip " << strip_width << " mm wide, " << inner_walls.size() << " inner walls, " << filler_widths.size() << " fillers");
+    REQUIRE(! inner_walls.empty());
+    for (const double w : inner_walls) {
+        CHECK(w <= max_spacing * 1.01);
+        CHECK(w >= min_spacing * 0.99);
+    }
+    for (const double w : filler_widths)
+        CHECK(w >= filler_spacing * 0.99);
+}
+
+TEST_CASE("Wall width limits cap inner walls through wall count transitions", "[Arachne]") {
+    // Where the number of walls changes, Arachne widens the walls beside the transition for a while. Along a strip that
+    // tapers through several transitions, with wall width limits no inner wall is wider than the maximum anywhere.
+    const int distribution_count = GENERATE(1, 3, 6);
+
+    constexpr double layer_height   = 0.28;
+    const double     spacing_offset = layer_height * (1. - 0.25 * PI);
+    const double     inner_spacing  = 0.45 - spacing_offset;
+    WallToolPathsParams params      = make_bbl_x1c_028_params(85);
+    params.wall_distribution_count  = distribution_count;
+    const double     max_spacing    = 0.65 - spacing_offset;
+    set_wall_width_limits(params, inner_spacing, double(params.min_bead_width) - spacing_offset, max_spacing, 5);
+
+    // 30 mm long, from 1.0 mm wide to 3.4 mm: from one inner wall a side to four.
+    const Polygons outline{ Polygon({ Point::new_scale(0., 0.), Point::new_scale(30., 0.), Point::new_scale(30., 3.4),
+                                      Point::new_scale(0., 1.0) }) };
+    WallToolPaths walls(outline, scaled<coord_t>(0.42 - spacing_offset), scaled<coord_t>(inner_spacing), 5, 0, layer_height, params);
+    std::vector<VariableWidthLines> toolpaths = walls.getToolPaths();
+    split_center_walls(toolpaths, scaled<coord_t>(inner_spacing), scaled<coord_t>(max_spacing), scaled<coord_t>(0.5), scaled<coord_t>(0.15 - spacing_offset));
+
+    double widest = 0.;
+    for (const VariableWidthLines &lines : toolpaths)
+        for (const ExtrusionLine &line : lines)
+            if (line.inset_idx > 0)
+                for (const ExtrusionJunction &junction : line.junctions)
+                    widest = std::max(widest, unscaled(junction.w));
+    INFO("distribution count " << distribution_count << ", widest inner wall " << widest << " mm");
+    CHECK(widest <= max_spacing * 1.01);
+}
+
+TEST_CASE("Distributed beading keeps the middle bead on the center line", "[Arachne][Regression]") {
+    // Rounding put the middle bead of an odd bead count a few nanometres off the center line at a wall distribution
+    // count of 3 or more, and SkeletalTrapezoidation::generateJunctions() drops a bead more than 1 nm past it.
+    const int    distribution_count = GENERATE(1, 2, 3, 4, 5, 6);
+    const int    bead_count         = GENERATE(3, 5, 7, 9);
+    const double ratio              = GENERATE(0.9, 1.0, 1.13);
+
+    const coord_t                    width = scaled<coord_t>(0.45);
+    const DistributedBeadingStrategy strategy(width, scaled<coord_t>(0.4), PI / 4., 0.5, 0.5, distribution_count);
+    const coord_t                    thickness = coord_t(double(bead_count * width) * ratio);
+    const BeadingStrategy::Beading   beading   = strategy.compute(thickness, bead_count);
+    INFO("distribution count " << distribution_count << ", " << bead_count << " beads, thickness " << thickness);
+    CHECK(beading.toolpath_locations[size_t(bead_count / 2)] == thickness / 2);
+}
+
+TEST_CASE("Wall distribution count does not remove the middle wall", "[Arachne][Regression]") {
+    // The wall distribution count only decides how the walls share the width; where an odd number of walls leaves a
+    // middle wall does not depend on it. So a strip tapering through odd wall counts has the same middle wall at every
+    // distribution count. At 3 or more, rounding in DistributedBeadingStrategy used to drop parts of it.
+    const int distribution_count = GENERATE(3, 4, 5, 6);
+
+    constexpr double layer_height   = 0.28;
+    const double     spacing_offset = layer_height * (1. - 0.25 * PI);
+    const coord_t    bead_width_0   = scaled<coord_t>(0.42 - spacing_offset);
+    const coord_t    bead_width_x   = scaled<coord_t>(0.45 - spacing_offset);
+    // 30 mm long, tapering from 2.0772 to 2.6966 mm: from 5 walls to 7.
+    const Polygons outline{ Polygon({ Point::new_scale(0., 0.), Point::new_scale(30., 0.), Point::new_scale(30., 2.6966),
+                                      Point::new_scale(0., 2.0772) }) };
+
+    const auto middle_wall_length = [&](int count) {
+        WallToolPathsParams params     = make_bbl_x1c_028_params(85);
+        params.wall_distribution_count = count;
+        WallToolPaths walls(outline, bead_width_0, bead_width_x, 5, 0, layer_height, params);
+        double        length = 0.;
+        for (const VariableWidthLines &lines : walls.getToolPaths())
+            for (const ExtrusionLine &line : lines)
+                if (line.is_odd)
+                    for (size_t i = 1; i < line.junctions.size(); ++ i)
+                        length += unscaled((line.junctions[i].p - line.junctions[i - 1].p).cast<double>().norm());
+        return length;
+    };
+
+    const double reference = middle_wall_length(1);
+    REQUIRE(reference > 1.); // the strip has a middle wall to lose
+    INFO("distribution count " << distribution_count);
+    CHECK(std::abs(middle_wall_length(distribution_count) - reference) < 0.05);
 }
